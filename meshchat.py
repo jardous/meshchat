@@ -11,6 +11,9 @@ ASPECT   = "messenger"
 def packet_received(data, packet):
     """Callback for when a message arrives on an active link"""
     try:
+        # Trigger the system bell
+        print("\a", end="", flush=True)
+
         text = data.decode("utf-8")
         remote_identity = packet.link.get_remote_identity()
         if remote_identity:
