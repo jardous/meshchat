@@ -1,4 +1,4 @@
-# P2P RNS console chat 🛰️
+# A very simple P2P RNS console chat
 
 A lightweight, decentralized, and end-to-end encrypted chat application built on the Reticulum Network Stack. 
 
