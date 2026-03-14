@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+lxmf_chat.py  –  Console LXMF chat for Reticulum MeshChat
+============================================================
+A jardous/meshchat-style terminal app that is fully compatible with
+Reticulum MeshChat (liamcottle), Sideband, and Nomad Network.
+
+Install:
+    pip install rns lxmf
+
+Run:
+    python lxmf_chat.py                          # auto display name
+    python lxmf_chat.py --name "Alice"           # set display name
+    python lxmf_chat.py --name "Alice" --to <hash>   # start with a peer
+
+In-app commands:
+    /to <hash>       – set the active conversation peer
+    /peers           – list all discovered LXMF peers
+    /me              – show your LXMF address and display name
+    /announce        – re-announce yourself to the network
+    /help            – show command list
+    /quit  /exit     – quit
+    <anything else>  – send as a message to the active peer
+"""
+
+import argparse
+import os
+import sys
+import threading
+import time
+
+# ── RNS / LXMF ──────────────────────────────────────────────────────────────
+try:
+    import RNS
+    import LXMF
+except ImportError:
+    sys.exit("Missing packages – run:  pip install rns lxmf")
+
+# ────────────────────────────────────────────────────────────────────────────
+# ANSI colours (gracefully disabled on Windows without colorama)
+# ────────────────────────────────────────────────────────────────────────────
+try:
+    import shutil
+    _tty = shutil.get_terminal_size().columns > 0
+except Exception:
+    _tty = False
+
+C_RESET  = "\033[0m"   if _tty else ""
+C_BOLD   = "\033[1m"   if _tty else ""
+C_DIM    = "\033[2m"   if _tty else ""
+C_CYAN   = "\033[36m"  if _tty else ""
+C_GREEN  = "\033[32m"  if _tty else ""
+C_YELLOW = "\033[33m"  if _tty else ""
+C_RED    = "\033[31m"  if _tty else ""
+C_BLUE   = "\033[34m"  if _tty else ""
+
+# ────────────────────────────────────────────────────────────────────────────
+# Global state
+# ────────────────────────────────────────────────────────────────────────────
+router:       LXMF.LXMRouter | None = None
+local_dest:   RNS.Destination | None = None
+local_identity: RNS.Identity | None = None
+display_name: str = "LXMFChat"
+
+active_peer:  str | None = None          # hex hash of current conversation
+peers:        dict[str, str] = {}        # hash_hex → display_name
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Print helpers  (keep incoming messages from garbling the input prompt)
+# ────────────────────────────────────────────────────────────────────────────
+_print_lock = threading.Lock()
+
+def _print(line: str) -> None:
+    with _print_lock:
+        # Clear current input line, print, restore prompt
+        sys.stdout.write("\r\033[K" + line + "\n")
+        sys.stdout.flush()
+
+
+def ts() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def info(msg: str)  -> None: _print(f"{C_DIM}[{ts()}]{C_RESET} {C_CYAN}{msg}{C_RESET}")
+def recv(who: str, msg: str) -> None:
+    _print(f"{C_DIM}[{ts()}]{C_RESET} {C_GREEN}{C_BOLD}{who}{C_RESET}{C_GREEN} >{C_RESET} {msg}")
+def sent(msg: str)  -> None: _print(f"{C_DIM}[{ts()}]{C_RESET} {C_BLUE}{C_BOLD}you{C_RESET}{C_BLUE} >{C_RESET} {msg}")
+def warn(msg: str)  -> None: _print(f"{C_DIM}[{ts()}]{C_RESET} {C_YELLOW}! {msg}{C_RESET}")
+def err(msg: str)   -> None: _print(f"{C_DIM}[{ts()}]{C_RESET} {C_RED}ERROR: {msg}{C_RESET}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# LXMF delivery callback  (Reticulum → us)
+# ────────────────────────────────────────────────────────────────────────────
+def on_delivery(message: LXMF.LXMessage) -> None:
+    try:
+        content = message.content.decode("utf-8", errors="replace").strip()
+        src_hex = message.source_hash.hex()
+
+        # Learn the peer's display name if we don't have it yet
+        sender_name = peers.get(src_hex, src_hex)
+
+        recv(sender_name, content)
+
+        # Auto-set active peer if we don't have one
+        global active_peer
+        if active_peer is None:
+            active_peer = src_hex
+            info(f"Active peer set to {sender_name}  ({src_hex})")
+
+    except Exception as exc:
+        err(f"on_delivery: {exc}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Announce handler  (peer discovery)
+# ────────────────────────────────────────────────────────────────────────────
+class AnnounceHandler:
+    aspect_filter = "lxmf.delivery"
+
+    def received_announce(
+        self,
+        destination_hash: bytes,
+        announced_identity: RNS.Identity,
+        app_data: bytes | None,
+    ) -> None:
+        h = destination_hash.hex()
+        name = ""
+        if app_data:
+            try:
+                name = app_data.decode("utf-8").strip()
+            except Exception:
+                pass
+
+        # Always update the display name if we got one; otherwise keep
+        # whatever we already know (fall back to short hash for new peers).
+        if name:
+            peers[h] = name
+        elif h not in peers:
+            peers[h] = ""
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Send an LXMF message
+# ────────────────────────────────────────────────────────────────────────────
+def send_message(dest_hash_hex: str, content: str) -> None:
+    if router is None or local_dest is None:
+        warn("Router not ready.")
+        return
+
+    try:
+        dest_hash = bytes.fromhex(dest_hash_hex)
+        identity  = RNS.Identity.recall(dest_hash)
+
+        if identity is None:
+            warn(
+                f"No path to {dest_hash_hex} yet.  "
+                "Wait for their announce or check the hash."
+            )
+            return
+
+        destination = RNS.Destination(
+            identity,
+            RNS.Destination.OUT,
+            RNS.Destination.SINGLE,
+            "lxmf",
+            "delivery",
+        )
+
+        lxm = LXMF.LXMessage(
+            destination,
+            local_dest,
+            content,
+            title          = "",
+            desired_method = LXMF.LXMessage.DIRECT,
+        )
+        lxm.try_propagation_on_fail = True   # fall back to propagation node
+
+        router.handle_outbound(lxm)
+        sent(content)
+
+    except Exception as exc:
+        err(f"send_message: {exc}")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Commands
+# ────────────────────────────────────────────────────────────────────────────
+def cmd_peers() -> None:
+    if not peers:
+        info("No peers discovered yet.  Wait for announces or ask them to /announce.")
+        return
+    info(f"{'─'*72}")
+    info(f"  {'#':<4} {'Display name':<20} {'Hash'}")
+    info(f"{'─'*72}")
+    for i, (h, name) in enumerate(peers.items(), 1):
+        marker = " ◄" if h == active_peer else ""
+        # only show name column when we actually have a name
+        display = name if name != h else ""
+        info(f"  {i:<4} {display:<20} {h}{marker}")
+    info(f"{'─'*72}")
+
+
+def cmd_me() -> None:
+    if local_dest is None:
+        warn("Not initialised yet.")
+        return
+    h = local_dest.hash.hex()
+    info(f"address : {C_BOLD}{h}{C_RESET}")
+    info(f"name    : {C_BOLD}{display_name}{C_RESET}")
+
+
+def cmd_to(args: str) -> None:
+    global active_peer
+    h = args.strip().split()[0].lower().replace(":", "") if args.strip() else ""
+    if len(h) != 32:
+        warn("Usage: /to <32-char LXMF address>")
+        return
+    active_peer = h
+    name = peers.get(h, h)
+    info(f"Active peer → {C_BOLD}{name}{C_RESET}  ({h})")
+
+
+def cmd_announce() -> None:
+    if router and local_dest:
+        router.announce(local_dest.hash)
+        info("Announced to network.")
+    else:
+        warn("Router not ready.")
+
+
+def cmd_help() -> None:
+    info("")
+    info(f"  {C_BOLD}/to <hash>{C_RESET}   – set active peer (32-char LXMF address)")
+    info(f"  {C_BOLD}/peers{C_RESET}       – list discovered LXMF peers")
+    info(f"  {C_BOLD}/me{C_RESET}          – show your LXMF address and name")
+    info(f"  {C_BOLD}/announce{C_RESET}    – re-announce yourself")
+    info(f"  {C_BOLD}/help{C_RESET}        – this help")
+    info(f"  {C_BOLD}/quit{C_RESET}        – exit")
+    info(f"  {C_BOLD}<text>{C_RESET}       – send to active peer")
+    info("")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Periodic re-announce background thread
+# ────────────────────────────────────────────────────────────────────────────
+def _announce_loop(interval: int = 300) -> None:
+    while True:
+        time.sleep(interval)
+        if router and local_dest:
+            try:
+                router.announce(local_dest.hash)
+            except Exception:
+                pass
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Initialise RNS + LXMF
+# ────────────────────────────────────────────────────────────────────────────
+def init(storage_path: str, name: str, rns_config: str | None) -> None:
+    global router, local_dest, local_identity, display_name
+
+    display_name = name
+    os.makedirs(storage_path, exist_ok=True)
+
+    # ── Reticulum ────────────────────────────────────────────────────────────
+    info("Starting Reticulum…")
+    if rns_config:
+        RNS.Reticulum(configdir=rns_config)
+    else:
+        RNS.Reticulum()
+
+    # ── Identity (persistent) ────────────────────────────────────────────────
+    id_path = os.path.join(storage_path, "identity")
+    if os.path.exists(id_path):
+        local_identity = RNS.Identity.from_file(id_path)
+        info(f"Loaded identity from {id_path}")
+    else:
+        local_identity = RNS.Identity()
+        local_identity.to_file(id_path)
+        info(f"New identity saved to {id_path}")
+
+    # ── LXM Router ───────────────────────────────────────────────────────────
+    # Let the router create and own the lxmf.delivery destination internally.
+    # Creating it ourselves first causes a duplicate-registration crash.
+    router = LXMF.LXMRouter(
+        identity    = local_identity,
+        storagepath = storage_path,
+    )
+    router.register_delivery_identity(local_identity, display_name=display_name)
+    router.register_delivery_callback(on_delivery)
+
+    # Retrieve the real Destination object the router just registered.
+    # We must NOT create a second one – that causes the duplicate crash.
+    local_dest_hash = RNS.Destination.hash(local_identity, "lxmf", "delivery")
+    local_dest = next(
+        (d for d in RNS.Transport.destinations if d.hash == local_dest_hash),
+        None,
+    )
+    if local_dest is None:
+        raise RuntimeError("Could not locate our LXMF delivery destination after registration.")
+
+    # ── Peer discovery ───────────────────────────────────────────────────────
+    RNS.Transport.register_announce_handler(AnnounceHandler())
+
+    # ── First announce ───────────────────────────────────────────────────────
+    router.announce(local_dest.hash)
+    info(f"Announced as {C_BOLD}{display_name}{C_RESET}  <{local_dest.hash.hex()}>")
+
+    # ── Background re-announce ───────────────────────────────────────────────
+    t = threading.Thread(target=_announce_loop, daemon=True)
+    t.start()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Main REPL
+# ────────────────────────────────────────────────────────────────────────────
+def repl() -> None:
+    global active_peer
+
+    info("")
+    info(f"  {C_BOLD}LXMF Chat{C_RESET} – Reticulum MeshChat compatible")
+    info(f"  Type {C_BOLD}/help{C_RESET} for commands, {C_BOLD}/quit{C_RESET} to exit.")
+    info("")
+    cmd_me()
+    info("")
+
+    while True:
+        peer_label = peers.get(active_peer, active_peer) if active_peer else "no peer"
+        try:
+            line = input(f"{C_DIM}[{peer_label}]{C_RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            info("Bye!")
+            break
+
+        if not line:
+            continue
+
+        if line.startswith("/"):
+            parts = line[1:].split(None, 1)
+            cmd   = parts[0].lower()
+            args  = parts[1] if len(parts) > 1 else ""
+
+            if cmd in ("quit", "exit", "q"):
+                info("Bye!")
+                break
+            elif cmd == "help":
+                cmd_help()
+            elif cmd == "peers":
+                cmd_peers()
+            elif cmd == "me":
+                cmd_me()
+            elif cmd == "announce":
+                cmd_announce()
+            elif cmd == "to":
+                cmd_to(args)
+            else:
+                warn(f"Unknown command /{cmd} – type /help")
+        else:
+            if active_peer is None:
+                warn("No active peer.  Use /to <hash> or /peers to pick one.")
+            else:
+                send_message(active_peer, line)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ────────────────────────────────────────────────────────────────────────────
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Console LXMF chat – compatible with Reticulum MeshChat",
+    )
+    p.add_argument(
+        "--name", "-n",
+        default="LXMFChat",
+        help="Display name announced to the network (default: LXMFChat)",
+    )
+    p.add_argument(
+        "--to", "-t",
+        dest="peer",
+        metavar="HASH",
+        help="32-char LXMF address of the peer to start chatting with",
+    )
+    p.add_argument(
+        "--storage",
+        default=os.path.expanduser("~/.lxmf-chat"),
+        metavar="PATH",
+        help="Directory for identity and LXMF storage (default: ~/.lxmf-chat)",
+    )
+    p.add_argument(
+        "--rns-config",
+        metavar="DIR",
+        help="Reticulum config directory (default: ~/.reticulum)",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    init(
+        storage_path = args.storage,
+        name         = args.name,
+        rns_config   = args.rns_config,
+    )
+
+    if args.peer:
+        h = args.peer.strip().lower().replace(":", "")
+        if len(h) == 32:
+            global active_peer
+            active_peer = h
+            info(f"Active peer set from command line: {h}")
+        else:
+            warn("--to hash must be 64 hex characters – ignored.")
+
+    repl()
+
+
+if __name__ == "__main__":
+    main()
