@@ -69,12 +69,14 @@ peers:        dict[str, str] = {}        # hash_hex → display_name
 # ────────────────────────────────────────────────────────────────────────────
 # Print helpers  (keep incoming messages from garbling the input prompt)
 # ────────────────────────────────────────────────────────────────────────────
-_print_lock = threading.Lock()
+_print_lock   = threading.Lock()
+current_prompt = ""          # updated by the REPL before each input() call
 
 def _print(line: str) -> None:
     with _print_lock:
-        # Clear current input line, print, restore prompt
-        sys.stdout.write("\r\033[K" + line + "\n")
+        # Erase current input line, print the message, then reprint the prompt
+        # so the cursor is back where the user expects it.
+        sys.stdout.write("\r\033[K" + line + "\n" + current_prompt)
         sys.stdout.flush()
 
 
@@ -84,7 +86,7 @@ def ts() -> str:
 
 def info(msg: str)  -> None: _print(f"{C_DIM}[{ts()}]{C_RESET} {C_CYAN}{msg}{C_RESET}")
 def recv(who: str, msg: str) -> None:
-    _print(f"{C_DIM}[{ts()}]{C_RESET} {C_GREEN}{C_BOLD}{who}{C_RESET}{C_GREEN} >{C_RESET} {msg}")
+    _print(f"\x07{C_DIM}[{ts()}]{C_RESET} {C_GREEN}{C_BOLD}{who}{C_RESET}{C_GREEN} >{C_RESET} {msg}")
 def sent(msg: str)  -> None: _print(f"{C_DIM}[{ts()}]{C_RESET} {C_BLUE}{C_BOLD}you{C_RESET}{C_BLUE} >{C_RESET} {msg}")
 def warn(msg: str)  -> None: _print(f"{C_DIM}[{ts()}]{C_RESET} {C_YELLOW}! {msg}{C_RESET}")
 def err(msg: str)   -> None: _print(f"{C_DIM}[{ts()}]{C_RESET} {C_RED}ERROR: {msg}{C_RESET}")
@@ -98,16 +100,19 @@ def on_delivery(message: LXMF.LXMessage) -> None:
         content = message.content.decode("utf-8", errors="replace").strip()
         src_hex = message.source_hash.hex()
 
-        # Learn the peer's display name if we don't have it yet
-        sender_name = peers.get(src_hex, src_hex)
+        # Use known display name, or fall back to hash
+        sender_name = peers.get(src_hex) or src_hex
 
         recv(sender_name, content)
 
-        # Auto-set active peer if we don't have one
-        global active_peer
+        # Auto-set active peer if we don't have one, then refresh the prompt
+        global active_peer, current_prompt
         if active_peer is None:
             active_peer = src_hex
-            info(f"Active peer set to {sender_name}  ({src_hex})")
+            current_prompt = f"{C_DIM}[{sender_name}]{C_RESET} "
+            with _print_lock:
+                sys.stdout.write("\r\033[K" + current_prompt)
+                sys.stdout.flush()
 
     except Exception as exc:
         err(f"on_delivery: {exc}")
@@ -137,6 +142,12 @@ class AnnounceHandler:
         # whatever we already know (fall back to short hash for new peers).
         if name:
             peers[h] = name
+            # If this is our active peer and we now have their name, refresh prompt
+            if h == active_peer:
+                current_prompt = f"{C_DIM}[{name}]{C_RESET} "
+                with _print_lock:
+                    sys.stdout.write("\r\033[K" + current_prompt)
+                    sys.stdout.flush()
         elif h not in peers:
             peers[h] = ""
 
@@ -195,9 +206,8 @@ def cmd_peers() -> None:
     info(f"  {'#':<4} {'Display name':<20} {'Hash'}")
     info(f"{'─'*72}")
     for i, (h, name) in enumerate(peers.items(), 1):
-        marker = " ◄" if h == active_peer else ""
-        # only show name column when we actually have a name
-        display = name if name != h else ""
+        marker  = " ◄" if h == active_peer else ""
+        display = name if name else ""
         info(f"  {i:<4} {display:<20} {h}{marker}")
     info(f"{'─'*72}")
 
@@ -212,14 +222,28 @@ def cmd_me() -> None:
 
 
 def cmd_to(args: str) -> None:
-    global active_peer
-    h = args.strip().split()[0].lower().replace(":", "") if args.strip() else ""
-    if len(h) != 32:
-        warn("Usage: /to <32-char LXMF address>")
-        return
-    active_peer = h
-    name = peers.get(h, h)
-    info(f"Active peer → {C_BOLD}{name}{C_RESET}  ({h})")
+    global active_peer, current_prompt
+    token = args.strip().split()[0] if args.strip() else ""
+
+    # Allow selecting by index number from /peers
+    if token.isdigit():
+        idx = int(token)
+        peer_list = list(peers.items())
+        if idx < 1 or idx > len(peer_list):
+            warn(f"Index {idx} out of range – use /peers to list peers.")
+            return
+        h, name = peer_list[idx - 1]
+    else:
+        h = token.lower().replace(":", "")
+        if len(h) != 32:
+            warn("Usage: /to <index>  or  /to <32-char LXMF address>")
+            return
+        name = peers.get(h) or ""
+
+    active_peer    = h
+    label          = name or h
+    current_prompt = f"{C_DIM}[{label}]{C_RESET} "
+    info(f"Active peer → {C_BOLD}{label}{C_RESET}  {h}")
 
 
 def cmd_announce() -> None:
@@ -232,7 +256,7 @@ def cmd_announce() -> None:
 
 def cmd_help() -> None:
     info("")
-    info(f"  {C_BOLD}/to <hash>{C_RESET}   – set active peer (32-char LXMF address)")
+    info(f"  {C_BOLD}/to <index|hash>{C_RESET}  – set active peer by index or 32-char address")
     info(f"  {C_BOLD}/peers{C_RESET}       – list discovered LXMF peers")
     info(f"  {C_BOLD}/me{C_RESET}          – show your LXMF address and name")
     info(f"  {C_BOLD}/announce{C_RESET}    – re-announce yourself")
@@ -317,7 +341,7 @@ def init(storage_path: str, name: str, rns_config: str | None) -> None:
 # Main REPL
 # ────────────────────────────────────────────────────────────────────────────
 def repl() -> None:
-    global active_peer
+    global active_peer, current_prompt
 
     info("")
     info(f"  {C_BOLD}LXMF Chat{C_RESET} – Reticulum MeshChat compatible")
@@ -325,17 +349,26 @@ def repl() -> None:
     info("")
     cmd_me()
     info("")
+    # Draw the initial prompt (after this, _print handles repainting it)
+    current_prompt = f"{C_DIM}[no peer]{C_RESET} "
+    sys.stdout.write(current_prompt)
+    sys.stdout.flush()
 
     while True:
-        peer_label = peers.get(active_peer, active_peer) if active_peer else "no peer"
+        peer_label     = (peers.get(active_peer) or active_peer) if active_peer else "no peer"
+        current_prompt = f"{C_DIM}[{peer_label}]{C_RESET} "
         try:
-            line = input(f"{C_DIM}[{peer_label}]{C_RESET} ").strip()
+            line = input("").strip()
         except (EOFError, KeyboardInterrupt):
+            current_prompt = ""
             print()
             info("Bye!")
             break
 
         if not line:
+            # Nothing was printed, so draw the prompt manually
+            sys.stdout.write(current_prompt)
+            sys.stdout.flush()
             continue
 
         if line.startswith("/"):
