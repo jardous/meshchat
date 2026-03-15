@@ -95,6 +95,20 @@ def _display_name_for(h: str) -> str:
     """Custom name takes priority over announced name."""
     return custom_names.get(h) or peers.get(h) or ""
 
+def _saved_path() -> str:
+    return os.path.join(_storage_path, "saved_peers.json")
+
+def _load_saved_peers() -> dict:
+    try:
+        with open(_saved_path()) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def _save_peers_file(data: dict) -> None:
+    with open(_saved_path(), "w") as f:
+        json.dump(data, f, indent=2)
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Print helpers  (keep incoming messages from garbling the input prompt)
@@ -309,6 +323,18 @@ def cmd_rename(args: str) -> None:
         current_prompt = f"{C_DIM}[{new_name}]{C_RESET} "
 
 
+def cmd_save() -> None:
+    if active_peer is None:
+        warn("No active peer to save.")
+        return
+    h    = active_peer
+    name = _display_name_for(h)
+    data = _load_saved_peers()
+    data[h] = name
+    _save_peers_file(data)
+    info(f"Saved {C_BOLD}{name or h}{C_RESET}  ({h})")
+
+
 def cmd_announce() -> None:
     if router and local_dest:
         router.announce(local_dest.hash)
@@ -323,6 +349,7 @@ def cmd_help() -> None:
     info(f"  {C_BOLD}/peers{C_RESET}       – list discovered LXMF peers")
     info(f"  {C_BOLD}/me{C_RESET}          – show your LXMF address and name")
     info(f"  {C_BOLD}/announce{C_RESET}    – re-announce yourself")
+    info(f"  {C_BOLD}/save{C_RESET}        – save active peer to disk")
     info(f"  {C_BOLD}/help{C_RESET}        – this help")
     info(f"  {C_BOLD}/rename <index|hash> <name>{C_RESET}  – set a persistent local name")
     info(f"  {C_BOLD}/quit{C_RESET}        – exit")
@@ -354,6 +381,9 @@ def init(storage_path: str, name: str, rns_config: str | None) -> None:
     _storage_path = storage_path
     os.makedirs(storage_path, exist_ok=True)
     _load_custom_names()
+    for h, name in _load_saved_peers().items():
+        if h not in peers:
+            peers[h] = name
 
     # ── Reticulum ────────────────────────────────────────────────────────────
     info("Starting Reticulum…")
@@ -458,6 +488,8 @@ def repl() -> None:
                 cmd_to(args)
             elif cmd == "rename":
                 cmd_rename(args)
+            elif cmd == "save":
+                cmd_save()
             else:
                 warn(f"Unknown command /{cmd} – type /help")
         else:
