@@ -28,6 +28,10 @@ import os
 import sys
 import threading
 import time
+try:
+    import readline  # noqa: F401  enables arrow-key history on Linux/macOS
+except ImportError:
+    pass  # not available on Windows
 
 # ── RNS / LXMF ──────────────────────────────────────────────────────────────
 try:
