@@ -63,7 +63,33 @@ local_identity: RNS.Identity | None = None
 display_name: str = "LXMFChat"
 
 active_peer:  str | None = None          # hex hash of current conversation
-peers:        dict[str, str] = {}        # hash_hex → display_name
+peers:        dict[str, str] = {}        # hash_hex → announced display_name
+custom_names: dict[str, str] = {}        # hash_hex → user-set name (persisted)
+_storage_path: str = ""
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Persistent custom peer names
+# ────────────────────────────────────────────────────────────────────────────
+import json
+
+def _names_path() -> str:
+    return os.path.join(_storage_path, "peer_names.json")
+
+def _load_custom_names() -> None:
+    try:
+        with open(_names_path()) as f:
+            custom_names.update(json.load(f))
+    except FileNotFoundError:
+        pass
+
+def _save_custom_names() -> None:
+    with open(_names_path(), "w") as f:
+        json.dump(custom_names, f, indent=2)
+
+def _display_name_for(h: str) -> str:
+    """Custom name takes priority over announced name."""
+    return custom_names.get(h) or peers.get(h) or ""
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -101,7 +127,7 @@ def on_delivery(message: LXMF.LXMessage) -> None:
         src_hex = message.source_hash.hex()
 
         # Use known display name, or fall back to hash
-        sender_name = peers.get(src_hex) or src_hex
+        sender_name = _display_name_for(src_hex) or src_hex
 
         recv(sender_name, content)
 
@@ -134,22 +160,29 @@ class AnnounceHandler:
         name = ""
         if app_data:
             try:
-                name = app_data.decode("utf-8").strip()
+                # LXMF app_data is msgpack([display_name_bytes, stamp_cost])
+                # Format: 0x92 (fixarray 2) | 0xc4 (bin8) | <len> | <name bytes> | ...
+                # Parse without requiring the msgpack package.
+                if len(app_data) >= 4 and app_data[0] == 0x92 and app_data[1] == 0xc4:
+                    n = app_data[2]
+                    name = app_data[3:3 + n].decode("utf-8").strip()
+                else:
+                    # Older/other clients send raw UTF-8
+                    name = app_data.decode("utf-8").strip()
             except Exception:
                 pass
 
-        # Always update the display name if we got one; otherwise keep
-        # whatever we already know (fall back to short hash for new peers).
         if name:
             peers[h] = name
-            # If this is our active peer and we now have their name, refresh prompt
-            if h == active_peer:
-                current_prompt = f"{C_DIM}[{name}]{C_RESET} "
-                with _print_lock:
-                    sys.stdout.write("\r\033[K" + current_prompt)
-                    sys.stdout.flush()
         elif h not in peers:
             peers[h] = ""
+        # Refresh prompt if this is the active peer and no custom name overrides
+        if h == active_peer and not custom_names.get(h):
+            label = _display_name_for(h) or h
+            current_prompt = f"{C_DIM}[{label}]{C_RESET} "
+            with _print_lock:
+                sys.stdout.write("\r\033[K" + current_prompt)
+                sys.stdout.flush()
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -205,9 +238,9 @@ def cmd_peers() -> None:
     info(f"{'─'*72}")
     info(f"  {'#':<4} {'Display name':<20} {'Hash'}")
     info(f"{'─'*72}")
-    for i, (h, name) in enumerate(peers.items(), 1):
+    for i, (h, _) in enumerate(peers.items(), 1):
         marker  = " ◄" if h == active_peer else ""
-        display = name if name else ""
+        display = _display_name_for(h)
         info(f"  {i:<4} {display:<20} {h}{marker}")
     info(f"{'─'*72}")
 
@@ -238,12 +271,38 @@ def cmd_to(args: str) -> None:
         if len(h) != 32:
             warn("Usage: /to <index>  or  /to <32-char LXMF address>")
             return
-        name = peers.get(h) or ""
+        name = _display_name_for(h)
 
     active_peer    = h
     label          = name or h
     current_prompt = f"{C_DIM}[{label}]{C_RESET} "
     info(f"Active peer → {C_BOLD}{label}{C_RESET}  {h}")
+
+
+def cmd_rename(args: str) -> None:
+    tokens = args.strip().split(None, 1)
+    if len(tokens) < 2:
+        warn("Usage: /rename <index|hash> <new name>")
+        return
+    token, new_name = tokens[0], tokens[1].strip()
+    if token.isdigit():
+        idx = int(token)
+        peer_list = list(peers.items())
+        if idx < 1 or idx > len(peer_list):
+            warn(f"Index {idx} out of range.")
+            return
+        h = peer_list[idx - 1][0]
+    else:
+        h = token.lower().replace(":", "")
+        if len(h) != 32:
+            warn("Usage: /rename <index|hash> <new name>")
+            return
+    custom_names[h] = new_name
+    _save_custom_names()
+    info(f"Renamed {h} → {C_BOLD}{new_name}{C_RESET}")
+    global current_prompt
+    if h == active_peer:
+        current_prompt = f"{C_DIM}[{new_name}]{C_RESET} "
 
 
 def cmd_announce() -> None:
@@ -261,6 +320,7 @@ def cmd_help() -> None:
     info(f"  {C_BOLD}/me{C_RESET}          – show your LXMF address and name")
     info(f"  {C_BOLD}/announce{C_RESET}    – re-announce yourself")
     info(f"  {C_BOLD}/help{C_RESET}        – this help")
+    info(f"  {C_BOLD}/rename <index|hash> <name>{C_RESET}  – set a persistent local name")
     info(f"  {C_BOLD}/quit{C_RESET}        – exit")
     info(f"  {C_BOLD}<text>{C_RESET}       – send to active peer")
     info("")
@@ -286,7 +346,10 @@ def init(storage_path: str, name: str, rns_config: str | None) -> None:
     global router, local_dest, local_identity, display_name
 
     display_name = name
+    global _storage_path
+    _storage_path = storage_path
     os.makedirs(storage_path, exist_ok=True)
+    _load_custom_names()
 
     # ── Reticulum ────────────────────────────────────────────────────────────
     info("Starting Reticulum…")
@@ -355,7 +418,7 @@ def repl() -> None:
     sys.stdout.flush()
 
     while True:
-        peer_label     = (peers.get(active_peer) or active_peer) if active_peer else "no peer"
+        peer_label     = (_display_name_for(active_peer) or active_peer) if active_peer else "no peer"
         current_prompt = f"{C_DIM}[{peer_label}]{C_RESET} "
         try:
             line = input("").strip()
@@ -389,6 +452,8 @@ def repl() -> None:
                 cmd_announce()
             elif cmd == "to":
                 cmd_to(args)
+            elif cmd == "rename":
+                cmd_rename(args)
             else:
                 warn(f"Unknown command /{cmd} – type /help")
         else:
