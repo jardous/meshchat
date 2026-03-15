@@ -139,15 +139,60 @@ def err(msg: str)   -> None: _print(f"{C_DIM}[{ts()}]{C_RESET} {C_RED}ERROR: {ms
 # ────────────────────────────────────────────────────────────────────────────
 # LXMF delivery callback  (Reticulum → us)
 # ────────────────────────────────────────────────────────────────────────────
+_images: list[str] = []   # indexed list of received image/file paths
+
+def _add_image(path: str) -> int:
+    """Register a received file and return its 1-based index."""
+    _images.append(path)
+    return len(_images)
+
+
+def _save_attachment(sender_hex: str, filename: str, data: bytes) -> str:
+    """Save attachment bytes to storage and return the file path."""
+    att_dir = os.path.join(_storage_path, "attachments")
+    os.makedirs(att_dir, exist_ok=True)
+    # Prefix with short sender hash to avoid collisions
+    safe_name = f"{sender_hex[:8]}_{filename}"
+    path = os.path.join(att_dir, safe_name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
 def on_delivery(message: LXMF.LXMessage) -> None:
     try:
         content = message.content.decode("utf-8", errors="replace").strip()
         src_hex = message.source_hash.hex()
-
-        # Use known display name, or fall back to hash
         sender_name = _display_name_for(src_hex) or src_hex
 
-        recv(sender_name, content)
+        if content:
+            recv(sender_name, content)
+
+        # ── FIELD_IMAGE (6): [image_type, image_bytes] ───────────────────────
+        image_field = message.fields.get(LXMF.FIELD_IMAGE)
+        if image_field and isinstance(image_field, list) and len(image_field) >= 2:
+            img_type = image_field[0] if isinstance(image_field[0], str) else "image"
+            img_data = image_field[1]
+            ext      = img_type.split("/")[-1] if "/" in img_type else img_type
+            fpath    = _save_attachment(src_hex, f"image.{ext}", img_data)
+            idx      = _add_image(fpath)
+            recv(sender_name, f"📷 image.{ext}  ({len(img_data)//1024}kB)  → /open {idx}")
+
+        # ── FIELD_FILE_ATTACHMENTS (5): [[name, bytes], ...] ─────────────────
+        files_field = message.fields.get(LXMF.FIELD_FILE_ATTACHMENTS)
+        if files_field and isinstance(files_field, list):
+            for attachment in files_field:
+                if not (isinstance(attachment, list) and len(attachment) >= 2):
+                    continue
+                fname = attachment[0] if isinstance(attachment[0], str) else "file"
+                fdata = attachment[1]
+                fpath = _save_attachment(src_hex, fname, fdata)
+                ext   = os.path.splitext(fname)[1].lower()
+                if ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff"):
+                    idx = _add_image(fpath)
+                    recv(sender_name, f"📷 {fname}  ({len(fdata)//1024}kB)  → /open {idx}")
+                else:
+                    recv(sender_name, f"📎 {fname}  ({len(fdata)//1024}kB)  saved: {fpath}")
 
         # Auto-set active peer if we don't have one, then refresh the prompt
         global active_peer, current_prompt
@@ -323,6 +368,20 @@ def cmd_rename(args: str) -> None:
         current_prompt = f"{C_DIM}[{new_name}]{C_RESET} "
 
 
+def cmd_open(args: str) -> None:
+    token = args.strip()
+    if not token.isdigit():
+        warn("Usage: /open <index>  — use the number shown with received images")
+        return
+    idx = int(token)
+    if idx < 1 or idx > len(_images):
+        warn(f"No image #{idx}.  Received images: {len(_images)}")
+        return
+    path = _images[idx - 1]
+    info(f"Opening {path}")
+    threading.Thread(target=lambda: os.system(f"feh {path!r}"), daemon=True).start()
+
+
 def cmd_save() -> None:
     if active_peer is None:
         warn("No active peer to save.")
@@ -350,6 +409,7 @@ def cmd_help() -> None:
     info(f"  {C_BOLD}/me{C_RESET}          – show your LXMF address and name")
     info(f"  {C_BOLD}/announce{C_RESET}    – re-announce yourself")
     info(f"  {C_BOLD}/save{C_RESET}        – save active peer to disk")
+    info(f"  {C_BOLD}/open <n>{C_RESET}    – open received image #{n} with feh")
     info(f"  {C_BOLD}/help{C_RESET}        – this help")
     info(f"  {C_BOLD}/rename <index|hash> <name>{C_RESET}  – set a persistent local name")
     info(f"  {C_BOLD}/quit{C_RESET}        – exit")
@@ -490,6 +550,8 @@ def repl() -> None:
                 cmd_rename(args)
             elif cmd == "save":
                 cmd_save()
+            elif cmd == "open":
+                cmd_open(args)
             else:
                 warn(f"Unknown command /{cmd} – type /help")
         else:
