@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshchat-console"
+version = "0.2.0"
+description = "Lightweight Reticulum and LXMF console chat clients"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "rns>=1.5.7,<2",
+    "lxmf>=1.2.1,<2",
+    "prompt-toolkit>=3.0.43,<4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1", "build>=1.2,<2"]
+
+[project.scripts]
+lxmf-chat = "lxmf_chat:main"
+meshchat = "meshchat:main"
+
+[tool.setuptools]
+py-modules = ["meshchat", "lxmf_chat", "chat_utils"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
